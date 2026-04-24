@@ -27,6 +27,7 @@ type Record struct {
 	Failed          bool
 	Fail            Failure
 	Detail          Detail
+	Thinking        *Thinking
 	// ResponseHeaders stores a snapshot of upstream response headers for usage sinks.
 	ResponseHeaders http.Header
 }
@@ -105,6 +106,14 @@ func ReasoningEffortFromContext(ctx context.Context) string {
 	default:
 		return ""
 	}
+}
+
+// Thinking captures the request's configured thinking/reasoning intensity.
+type Thinking struct {
+	Intensity string `json:"intensity,omitempty"`
+	Mode      string `json:"mode,omitempty"`
+	Level     string `json:"level,omitempty"`
+	Budget    int    `json:"budget,omitempty"`
 }
 
 // Plugin consumes usage records emitted by the proxy runtime.

@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
@@ -28,6 +29,7 @@ type UsageReporter struct {
 	source      string
 	reasoning   string
 	requestedAt time.Time
+	thinking    *usage.Thinking
 	once        sync.Once
 }
 
@@ -100,6 +102,7 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	}
 	detail = normalizeUsageDetailTotal(detail)
 	r.once.Do(func() {
+		r.captureThinkingFromContext(ctx)
 		r.publishRecord(ctx, r.buildRecord(detail, failed, fail))
 	})
 }
@@ -133,6 +136,7 @@ func (r *UsageReporter) EnsurePublished(ctx context.Context) {
 		return
 	}
 	r.once.Do(func() {
+		r.captureThinkingFromContext(ctx)
 		r.publishRecord(ctx, r.buildRecord(usage.Detail{}, false, usage.Failure{}))
 	})
 }
@@ -172,7 +176,15 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		Failed:          failed,
 		Fail:            fail,
 		Detail:          detail,
+		Thinking:        cloneUsageThinking(r.thinking),
 	}
+}
+
+func (r *UsageReporter) captureThinkingFromContext(ctx context.Context) {
+	if r == nil || r.thinking != nil {
+		return
+	}
+	r.thinking = UsageThinkingFromContext(ctx)
 }
 
 func failFromErrors(errs ...error) usage.Failure {
@@ -278,6 +290,146 @@ func resolveUsageAuthType(auth *cliproxyauth.Auth) string {
 		return "apikey"
 	}
 	return kind
+}
+
+func CaptureUsageThinkingFromRequest(ctx context.Context, body []byte) {
+	ginCtx := ginContextFrom(ctx)
+	if ginCtx == nil {
+		return
+	}
+	thinkingDetail := ParseUsageThinkingFromRequest(body)
+	if isUsageThinkingZero(thinkingDetail) {
+		return
+	}
+	ginCtx.Set(usageThinkingKey, thinkingDetail)
+}
+
+func UsageThinkingFromContext(ctx context.Context) *usage.Thinking {
+	ginCtx := ginContextFrom(ctx)
+	if ginCtx == nil {
+		return nil
+	}
+	value, exists := ginCtx.Get(usageThinkingKey)
+	if !exists {
+		return nil
+	}
+	switch v := value.(type) {
+	case usage.Thinking:
+		return cloneUsageThinking(&v)
+	case *usage.Thinking:
+		return cloneUsageThinking(v)
+	default:
+		return nil
+	}
+}
+
+func ParseUsageThinkingFromRequest(body []byte) usage.Thinking {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return usage.Thinking{}
+	}
+
+	if parsed := parseUsageThinkingLevel(body, "reasoning.effort"); !isUsageThinkingZero(parsed) {
+		return parsed
+	}
+	if parsed := parseUsageThinkingLevel(body, "reasoning_effort"); !isUsageThinkingZero(parsed) {
+		return parsed
+	}
+	if parsed := parseUsageThinkingLevel(body, "output_config.effort"); !isUsageThinkingZero(parsed) {
+		return parsed
+	}
+
+	for _, path := range []string{
+		"request.generationConfig.thinkingConfig.thinkingLevel",
+		"request.generationConfig.thinkingConfig.thinking_level",
+		"generationConfig.thinkingConfig.thinkingLevel",
+		"generationConfig.thinkingConfig.thinking_level",
+	} {
+		if parsed := parseUsageThinkingLevel(body, path); !isUsageThinkingZero(parsed) {
+			return parsed
+		}
+	}
+
+	for _, path := range []string{
+		"request.generationConfig.thinkingConfig.thinkingBudget",
+		"request.generationConfig.thinkingConfig.thinking_budget",
+		"generationConfig.thinkingConfig.thinkingBudget",
+		"generationConfig.thinkingConfig.thinking_budget",
+		"thinking.budget_tokens",
+	} {
+		if parsed := parseUsageThinkingBudget(body, path); !isUsageThinkingZero(parsed) {
+			return parsed
+		}
+	}
+
+	if thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String())); thinkingType != "" {
+		switch thinkingType {
+		case "disabled":
+			return usage.Thinking{Intensity: string(thinking.LevelNone), Mode: thinking.ModeNone.String(), Level: string(thinking.LevelNone)}
+		case "adaptive", "auto", "enabled":
+			return usage.Thinking{Intensity: string(thinking.LevelAuto), Mode: thinking.ModeAuto.String(), Level: string(thinking.LevelAuto)}
+		}
+	}
+
+	return usage.Thinking{}
+}
+
+func parseUsageThinkingLevel(body []byte, path string) usage.Thinking {
+	node := gjson.GetBytes(body, path)
+	if !node.Exists() {
+		return usage.Thinking{}
+	}
+	level := strings.ToLower(strings.TrimSpace(node.String()))
+	if level == "" {
+		return usage.Thinking{}
+	}
+	switch level {
+	case string(thinking.LevelNone):
+		return usage.Thinking{Intensity: level, Mode: thinking.ModeNone.String(), Level: level}
+	case string(thinking.LevelAuto):
+		return usage.Thinking{Intensity: level, Mode: thinking.ModeAuto.String(), Level: level}
+	default:
+		return usage.Thinking{Intensity: level, Mode: thinking.ModeLevel.String(), Level: level}
+	}
+}
+
+func parseUsageThinkingBudget(body []byte, path string) usage.Thinking {
+	node := gjson.GetBytes(body, path)
+	if !node.Exists() {
+		return usage.Thinking{}
+	}
+	budget := int(node.Int())
+	switch budget {
+	case 0:
+		return usage.Thinking{Intensity: string(thinking.LevelNone), Mode: thinking.ModeNone.String(), Level: string(thinking.LevelNone), Budget: 0}
+	case -1:
+		return usage.Thinking{Intensity: string(thinking.LevelAuto), Mode: thinking.ModeAuto.String(), Level: string(thinking.LevelAuto), Budget: -1}
+	default:
+		level, _ := thinking.ConvertBudgetToLevel(budget)
+		return usage.Thinking{Intensity: level, Mode: thinking.ModeBudget.String(), Level: level, Budget: budget}
+	}
+}
+
+func cloneUsageThinking(thinkingDetail *usage.Thinking) *usage.Thinking {
+	if thinkingDetail == nil {
+		return nil
+	}
+	clone := usage.Thinking{
+		Intensity: strings.TrimSpace(thinkingDetail.Intensity),
+		Mode:      strings.TrimSpace(thinkingDetail.Mode),
+		Level:     strings.TrimSpace(thinkingDetail.Level),
+		Budget:    thinkingDetail.Budget,
+	}
+	if isUsageThinkingZero(clone) {
+		return nil
+	}
+	return &clone
+}
+
+func isUsageThinkingZero(thinkingDetail usage.Thinking) bool {
+	return strings.TrimSpace(thinkingDetail.Intensity) == "" &&
+		strings.TrimSpace(thinkingDetail.Mode) == "" &&
+		strings.TrimSpace(thinkingDetail.Level) == "" &&
+		thinkingDetail.Budget == 0
 }
 
 func ParseCodexUsage(data []byte) (usage.Detail, bool) {

@@ -83,6 +83,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		Tokens:          tokens,
 		Failed:          failed,
 		Fail:            fail,
+		Thinking:        cloneThinking(record.Thinking),
 		ResponseHeaders: record.ResponseHeaders,
 	}
 
@@ -123,7 +124,15 @@ type requestDetail struct {
 	Tokens          tokenStats  `json:"tokens"`
 	Failed          bool        `json:"failed"`
 	Fail            failDetail  `json:"fail"`
+	Thinking        *thinking   `json:"thinking,omitempty"`
 	ResponseHeaders http.Header `json:"response_headers,omitempty"`
+}
+
+type thinking struct {
+	Intensity string `json:"intensity,omitempty"`
+	Mode      string `json:"mode,omitempty"`
+	Level     string `json:"level,omitempty"`
+	Budget    int    `json:"budget,omitempty"`
 }
 
 type tokenStats struct {
@@ -139,6 +148,22 @@ type tokenStats struct {
 type failDetail struct {
 	StatusCode int    `json:"status_code"`
 	Body       string `json:"body"`
+}
+
+func cloneThinking(value *coreusage.Thinking) *thinking {
+	if value == nil {
+		return nil
+	}
+	clone := thinking{
+		Intensity: strings.TrimSpace(value.Intensity),
+		Mode:      strings.TrimSpace(value.Mode),
+		Level:     strings.TrimSpace(value.Level),
+		Budget:    value.Budget,
+	}
+	if clone.Intensity == "" && clone.Mode == "" && clone.Level == "" && clone.Budget == 0 {
+		return nil
+	}
+	return &clone
 }
 
 func resolveFail(ctx context.Context, record coreusage.Record, failed bool) failDetail {

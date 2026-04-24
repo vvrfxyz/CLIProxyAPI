@@ -40,6 +40,12 @@ func TestUsageQueuePluginPayloadIncludesStableFieldsAndSuccess(t *testing.T) {
 				OutputTokens: 20,
 				TotalTokens:  30,
 			},
+			Thinking: &coreusage.Thinking{
+				Intensity: "high",
+				Mode:      "level",
+				Level:     "high",
+				Budget:    8192,
+			},
 			ResponseHeaders: responseHeaders.Clone(),
 		})
 		responseHeaders.Set("Retry-After", "999")
@@ -53,6 +59,7 @@ func TestUsageQueuePluginPayloadIncludesStableFieldsAndSuccess(t *testing.T) {
 		requireMissingField(t, payload, "user_api_key")
 		requireStringField(t, payload, "request_id", "ctx-request-id")
 		requireStringField(t, payload, "reasoning_effort", "medium")
+		requireThinkingField(t, payload, "high", "level", "high", 8192)
 		requireHeaderField(t, payload, "response_headers", "X-Upstream-Request-Id", []string{"upstream-req-1"})
 		requireHeaderField(t, payload, "response_headers", "Retry-After", []string{"30"})
 		requireBoolField(t, payload, "failed", false)
@@ -327,6 +334,27 @@ func requireFailField(t *testing.T, payload map[string]json.RawMessage, wantStat
 	}
 	if got.StatusCode != wantStatus || got.Body != wantBody {
 		t.Fatalf("fail = {status_code:%d body:%q}, want {status_code:%d body:%q}", got.StatusCode, got.Body, wantStatus, wantBody)
+	}
+}
+
+func requireThinkingField(t *testing.T, payload map[string]json.RawMessage, wantIntensity, wantMode, wantLevel string, wantBudget int) {
+	t.Helper()
+
+	raw, ok := payload["thinking"]
+	if !ok {
+		t.Fatalf("payload missing %q", "thinking")
+	}
+	var got struct {
+		Intensity string `json:"intensity"`
+		Mode      string `json:"mode"`
+		Level     string `json:"level"`
+		Budget    int    `json:"budget"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal thinking: %v", err)
+	}
+	if got.Intensity != wantIntensity || got.Mode != wantMode || got.Level != wantLevel || got.Budget != wantBudget {
+		t.Fatalf("thinking = {intensity:%q mode:%q level:%q budget:%d}, want {intensity:%q mode:%q level:%q budget:%d}", got.Intensity, got.Mode, got.Level, got.Budget, wantIntensity, wantMode, wantLevel, wantBudget)
 	}
 }
 

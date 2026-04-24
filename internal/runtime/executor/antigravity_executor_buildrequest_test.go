@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -166,6 +170,42 @@ func TestAntigravityBuildRequest_RejectsMissingProjectID(t *testing.T) {
 	}
 	if got := status.StatusCode(); got != http.StatusBadRequest {
 		t.Fatalf("status code = %d, want %d", got, http.StatusBadRequest)
+	}
+}
+
+func TestAntigravityBuildRequest_CapturesThinkingWhenRequestLogDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	executor := &AntigravityExecutor{cfg: &config.Config{}}
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
+	payload := []byte(`{
+		"request": {
+			"contents": [
+				{"role": "user", "parts": [{"text": "hello"}]}
+			],
+			"generationConfig": {
+				"thinkingConfig": {
+					"thinkingBudget": 8192
+				}
+			}
+		}
+	}`)
+
+	if _, err := executor.buildRequest(ctx, auth, "token", "gemini-3.1-flash-image", payload, false, "", "https://example.com"); err != nil {
+		t.Fatalf("buildRequest error: %v", err)
+	}
+
+	thinking := helps.UsageThinkingFromContext(ctx)
+	if thinking == nil {
+		t.Fatal("thinking metadata is nil, want captured metadata")
+	}
+	if thinking.Intensity != "medium" {
+		t.Fatalf("thinking intensity = %q, want medium", thinking.Intensity)
+	}
+	if thinking.Budget != 8192 {
+		t.Fatalf("thinking budget = %d, want 8192", thinking.Budget)
 	}
 }
 
