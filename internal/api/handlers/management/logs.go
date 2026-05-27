@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +22,23 @@ const (
 	logScannerInitialBuffer = 64 * 1024
 	logScannerMaxBuffer     = 8 * 1024 * 1024
 )
+
+var (
+	managementLogPrefixRegex = regexp.MustCompile(`^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+\[([a-fA-F0-9]{8}|--------)\]\s+\[([^\]]+)\]\s+(.*)$`)
+	managementLogMethodRegex = regexp.MustCompile(`\b(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\b\s+"?([^"\s]+)`)
+)
+
+type managementLogEntry struct {
+	Line                   string `json:"line"`
+	Timestamp              int64  `json:"timestamp,omitempty"`
+	RequestID              string `json:"request_id,omitempty"`
+	Level                  string `json:"level,omitempty"`
+	StatusCode             int    `json:"status_code,omitempty"`
+	Method                 string `json:"method,omitempty"`
+	Path                   string `json:"path,omitempty"`
+	RequestLogDownloadURL  string `json:"request_log_download_url,omitempty"`
+	RequestLogDownloadable bool   `json:"request_log_downloadable,omitempty"`
+}
 
 // GetLogs returns log lines with optional incremental loading.
 func (h *Handler) GetLogs(c *gin.Context) {
@@ -49,6 +67,7 @@ func (h *Handler) GetLogs(c *gin.Context) {
 			cutoff := parseCutoff(c.Query("after"))
 			c.JSON(http.StatusOK, gin.H{
 				"lines":            []string{},
+				"entries":          []managementLogEntry{},
 				"line-count":       0,
 				"latest-timestamp": cutoff,
 			})
@@ -73,12 +92,13 @@ func (h *Handler) GetLogs(c *gin.Context) {
 		}
 	}
 
-	lines, total, latest := acc.result()
+	lines, entries, total, latest := acc.result()
 	if latest == 0 || latest < cutoff {
 		latest = cutoff
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"lines":            lines,
+		"entries":          entries,
 		"line-count":       total,
 		"latest-timestamp": latest,
 	})
@@ -401,6 +421,7 @@ type logAccumulator struct {
 	cutoff  int64
 	limit   int
 	lines   []string
+	entries []managementLogEntry
 	total   int
 	latest  int64
 	include bool
@@ -412,9 +433,10 @@ func newLogAccumulator(cutoff int64, limit int) *logAccumulator {
 		capacity = limit
 	}
 	return &logAccumulator{
-		cutoff: cutoff,
-		limit:  limit,
-		lines:  make([]string, 0, capacity),
+		cutoff:  cutoff,
+		limit:   limit,
+		lines:   make([]string, 0, capacity),
+		entries: make([]managementLogEntry, 0, capacity),
 	}
 }
 
@@ -462,17 +484,86 @@ func (acc *logAccumulator) addLine(raw string) {
 }
 
 func (acc *logAccumulator) append(line string) {
+	entry := parseManagementLogEntry(line)
 	acc.lines = append(acc.lines, line)
+	acc.entries = append(acc.entries, entry)
 	if acc.limit > 0 && len(acc.lines) > acc.limit {
 		acc.lines = acc.lines[len(acc.lines)-acc.limit:]
+		acc.entries = acc.entries[len(acc.entries)-acc.limit:]
 	}
 }
 
-func (acc *logAccumulator) result() ([]string, int, int64) {
+func (acc *logAccumulator) result() ([]string, []managementLogEntry, int, int64) {
 	if acc.lines == nil {
 		acc.lines = []string{}
 	}
-	return acc.lines, acc.total, acc.latest
+	if acc.entries == nil {
+		acc.entries = []managementLogEntry{}
+	}
+	return acc.lines, acc.entries, acc.total, acc.latest
+}
+
+func parseManagementLogEntry(line string) managementLogEntry {
+	entry := managementLogEntry{Line: line}
+	match := managementLogPrefixRegex.FindStringSubmatch(line)
+	message := line
+	if len(match) == 5 {
+		if parsed, err := time.ParseInLocation("2006-01-02 15:04:05", match[1], time.Local); err == nil {
+			entry.Timestamp = parsed.Unix()
+		}
+		if match[2] != "--------" {
+			entry.RequestID = match[2]
+		}
+		entry.Level = strings.TrimSpace(match[3])
+		message = strings.TrimSpace(match[4])
+	}
+
+	segments := strings.Split(message, "|")
+	for _, segment := range segments {
+		trimmed := strings.TrimSpace(segment)
+		if entry.StatusCode == 0 {
+			if code, err := strconv.Atoi(trimmed); err == nil && code >= 100 && code <= 599 {
+				entry.StatusCode = code
+				continue
+			}
+		}
+
+		if entry.Method == "" {
+			method, path := parseLogMethodPath(trimmed)
+			if method != "" {
+				entry.Method = method
+				entry.Path = path
+			}
+		}
+	}
+
+	if entry.RequestID != "" && isDownloadableResponsesLogPath(entry.Path) {
+		entry.RequestLogDownloadable = true
+		entry.RequestLogDownloadURL = "/v0/management/request-log-by-id/" + entry.RequestID
+	}
+
+	return entry
+}
+
+func parseLogMethodPath(segment string) (string, string) {
+	match := managementLogMethodRegex.FindStringSubmatch(segment)
+	if len(match) != 3 {
+		return "", ""
+	}
+	method := match[1]
+	path := strings.Trim(match[2], `"`)
+	return method, path
+}
+
+func isDownloadableResponsesLogPath(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		path = path[:idx]
+	}
+	return path == "/v1/responses" || strings.HasPrefix(path, "/v1/responses/")
 }
 
 func parseCutoff(raw string) int64 {
